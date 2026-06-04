@@ -132,10 +132,18 @@ def stage_inference(records: list[dict], ollama_client) -> tuple[list[dict], dic
 
         if not SKIP_INFERENCE and ollama_client is not None:
             try:
-                raw = ollama_client.generate(TRIAGE_SYSTEM_PROMPT, user_msg, timeout=30.0)
-                # strip markdown fences if present
-                raw = raw.strip().removeprefix("```json").removesuffix("```").strip()
-                inference_result = json.loads(raw)
+                raw = ollama_client.generate(TRIAGE_SYSTEM_PROMPT, user_msg, timeout=60.0)
+                raw = raw.strip()
+                if raw.startswith("```"):
+                    raw = raw.split("```")[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                    raw = raw.strip()
+                raw = raw.split("\n")[0].strip()
+                parsed = json.loads(raw)
+                inference_result = parsed[0] if isinstance(parsed, list) else parsed
+                if not isinstance(inference_result, dict):
+                    raise ValueError(f"Unexpected inference result type: {type(inference_result)}")
             except Exception as exc:
                 console.print(f"[yellow]Ollama inference failed: {exc}. Using mock.[/yellow]")
 

@@ -3,15 +3,16 @@ services:
     image: ollama/ollama:latest
     ports:
       - "11434:11434"
+    environment:
+      OLLAMA_DEBUG: "false"
     volumes:
       - ollama_data:/root/.ollama
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:11434 || exit 1"]
+      test: ["CMD", "ollama", "list"]
       interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 12
       start_period: 30s
-    entrypoint: ["/bin/sh", "-c", "ollama serve & sleep 10 && ollama pull tinyllama && wait"]
 
   pipelineguard:
     build: .

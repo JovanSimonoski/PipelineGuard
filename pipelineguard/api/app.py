@@ -21,7 +21,7 @@ SENSITIVITY = os.getenv("ANOMALY_SENSITIVITY", "medium")
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "tinyllama")
 RUN_INTERVAL = int(os.getenv("PIPELINE_RUN_INTERVAL", "8"))
-WARMUP_RUNS = 15
+WARMUP_RUNS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +41,9 @@ async def lifespan(app: FastAPI):
     app.state.runner = runner
     app.state.scheduler = None
     app.state.auto_run_enabled = False
+
+    # Pull the model if not already present
+    ollama.ensure_model_pulled()
 
     # Warm up the baseline with normal runs before serving traffic
     console.print(
