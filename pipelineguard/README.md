@@ -3,8 +3,11 @@
 A proof-of-concept **security-aware anomaly detection system** for a mock healthcare AI inference pipeline. PipelineGuard instruments every stage of a synthetic patient-triage workflow and watches for three classes of attack — **data poisoning**, **adversarial inputs**, and **access abuse** — using rolling statistical baselines and per-stage probes.
 
 It ships with a FastAPI dashboard, a `tinyllama` (Ollama) inference backend with a deterministic fallback, and three injectable attack modes for live demonstrations.
+## Architecture
+<img width="679" height="896" alt="Screenshot 2026-06-05 210915" src="https://github.com/user-attachments/assets/42e09294-9792-47ac-8bfe-f8a6b216e6a0" />
 
-> ⚠️ **Demo only.** Synthetic data, in-memory state, simulated responses, no clinical validity, no authentication. Do not expose to untrusted networks.
+
+<img width="1682" height="729" alt="Screenshot 2026-06-05 212604" src="https://github.com/user-attachments/assets/7467b5ff-479f-47f5-8dc9-4db6ee5584a8" />
 
 ---
 
