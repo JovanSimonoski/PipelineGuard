@@ -25,7 +25,7 @@ services:
     environment:
       OLLAMA_HOST: http://ollama:11434
       OLLAMA_MODEL: tinyllama
-      PIPELINE_RUN_INTERVAL: "8"
+      PIPELINE_RUN_INTERVAL: "20"
       ANOMALY_SENSITIVITY: medium
       SKIP_INFERENCE: "false"
     volumes:

@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 """FastAPI application: REST endpoints + live HTML dashboard."""
 
 import asyncio
@@ -19,44 +20,47 @@ from store.telemetry import TelemetryStore
 
 console = Console()
 
-SENSITIVITY = os.getenv("ANOMALY_SENSITIVITY", "medium")
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "tinyllama")
-RUN_INTERVAL = int(os.getenv("PIPELINE_RUN_INTERVAL", "8"))
-WARMUP_RUNS = 5
+SENSITIVITY  = os.getenv("ANOMALY_SENSITIVITY",   "medium")
+OLLAMA_HOST  = os.getenv("OLLAMA_HOST",            "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL",           "tinyllama")
+RUN_INTERVAL = int(os.getenv("PIPELINE_RUN_INTERVAL", "20"))
+WARMUP_RUNS  = 2
+
+_SKEL      = "<div class='skel'></div>"
+_SKEL_ROW7 = "<tr><td colspan='7'>" + _SKEL + "</td></tr>"
+_SKEL_ROW3 = "<tr><td colspan='3'>" + _SKEL + "</td></tr>"
 
 
 # ---------------------------------------------------------------------------
-# Lifespan — warmup runs in a background thread so the server starts instantly
+# Lifespan
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     telemetry = TelemetryStore()
-    engine = AnomalyEngine(sensitivity=SENSITIVITY)
-    ollama = OllamaClient(host=OLLAMA_HOST, model=OLLAMA_MODEL)
-    runner = PipelineRunner(engine=engine, telemetry=telemetry, ollama_client=ollama)
+    engine    = AnomalyEngine(sensitivity=SENSITIVITY)
+    ollama    = OllamaClient(host=OLLAMA_HOST, model=OLLAMA_MODEL)
+    runner    = PipelineRunner(engine=engine, telemetry=telemetry, ollama_client=ollama)
 
-    app.state.telemetry = telemetry
-    app.state.engine = engine
-    app.state.ollama = ollama
-    app.state.runner = runner
-    app.state.scheduler = None
+    app.state.telemetry        = telemetry
+    app.state.engine           = engine
+    app.state.ollama           = ollama
+    app.state.runner           = runner
+    app.state.scheduler        = None
     app.state.auto_run_enabled = False
-    app.state.warmup_done = False
+    app.state.warmup_done      = False
+    app.state.start_time       = datetime.now(timezone.utc)
 
     def _background_init():
         """Pull model and seed baseline without blocking FastAPI startup."""
         try:
             ollama.ensure_model_pulled()
             console.print(
-                f"\n[PipelineGuard] Warming up baseline with {WARMUP_RUNS} normal runs...",
+                f"\n[PipelineGuard] Warming up with {WARMUP_RUNS} baseline runs...",
                 style="bold cyan",
             )
             for i in range(WARMUP_RUNS):
                 runner.run(attack_mode="normal")
-                if (i + 1) % 5 == 0:
-                    console.print(f"[PipelineGuard] Warmup {i + 1}/{WARMUP_RUNS}", style="cyan")
             console.print("[PipelineGuard] Warmup complete.", style="bold green")
         except Exception as exc:
             console.print(f"[PipelineGuard] Warmup error: {exc}", style="bold red")
@@ -71,7 +75,7 @@ async def lifespan(app: FastAPI):
             id="auto_run",
         )
         scheduler.start()
-        app.state.scheduler = scheduler
+        app.state.scheduler        = scheduler
         app.state.auto_run_enabled = True
 
     threading.Thread(target=_background_init, daemon=True).start()
@@ -93,235 +97,440 @@ app = FastAPI(title="PipelineGuard", version="0.1.0", lifespan=lifespan)
 class RunRequest(BaseModel):
     mode: str = "normal"
 
-
 class AutoRunRequest(BaseModel):
     enabled: bool
+
+
+# ---------------------------------------------------------------------------
+# Dashboard helpers
+# ---------------------------------------------------------------------------
+
+def _activity_feed_html(engine: AnomalyEngine, telemetry: TelemetryStore, warmup_done: bool) -> str:
+    alerts_raw      = engine.get_alerts(30)
+    alert_batch_ids = {a.get("batch_id", "") for a in alerts_raw}
+
+    ICONS  = {"critical": "&#x1F534;", "high": "&#x1F7E0;", "medium": "&#x26A0;", "low": "&#x1F535;"}
+    LABELS = {"critical": "Critical threat", "high": "High anomaly", "medium": "Anomaly detected", "low": "Low-severity event"}
+
+    events = []
+    for a in alerts_raw:
+        sev    = a["severity"]
+        threat = a["threat_type"].replace("_", " ").title()
+        stage  = a["stage"].replace("_", " ").title()
+        events.append({
+            "ts":     a["timestamp"][:19].replace("T", " "),
+            "icon":   ICONS.get(sev, "&#x26A0;"),
+            "label":  LABELS.get(sev, "Alert") + " &#x2014; " + threat,
+            "detail": stage + " &middot; score " + str(a["score"]) + " &middot; " + a["response_triggered"],
+            "cls":    "fi-" + sev,
+        })
+
+    for r in telemetry.get_recent("collection", n=20):
+        if r.batch_id not in alert_batch_ids:
+            events.append({
+                "ts":     r.timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                "icon":   "&#x2705;",
+                "label":  "Clean batch &mdash; " + str(r.record_count) + " records",
+                "detail": "All 5 stages cleared &middot; no threats",
+                "cls":    "fi-ok",
+            })
+
+    events.sort(key=lambda e: e["ts"], reverse=True)
+    events = events[:30]
+
+    # Collapse consecutive clean runs into one entry with a repeat count
+    collapsed = []
+    for ev in events:
+        if ev["cls"] == "fi-ok" and collapsed and collapsed[-1]["cls"] == "fi-ok":
+            collapsed[-1]["count"] = collapsed[-1].get("count", 1) + 1
+        else:
+            ev["count"] = 1
+            collapsed.append(ev)
+    events = collapsed[:12]
+
+    if not events:
+        if not warmup_done:
+            return "<div class='feed-empty'><div class='spinner'></div><span>Seeding baseline&hellip;</span></div>"
+        return "<div class='feed-empty'>No activity yet</div>"
+
+    html = ""
+    for ev in events:
+        count = ev.get("count", 1)
+        repeat = (" <span class='rep'>x" + str(count) + "</span>") if count > 1 else ""
+        html += (
+            "<div class='feed-item " + ev["cls"] + "'>"
+            "<div class='fi-icon'>" + ev["icon"] + "</div>"
+            "<div class='fi-body'>"
+            "<div class='fi-label'>" + ev["label"] + repeat + "</div>"
+            "<div class='fi-detail'>" + ev["detail"] + "</div>"
+            "<div class='fi-ts'>" + ev["ts"] + "</div>"
+            "</div></div>"
+        )
+    return html
 
 
 # ---------------------------------------------------------------------------
 # Dashboard HTML
 # ---------------------------------------------------------------------------
 
-_SKEL = "<div class='skel'></div>"
-_SKEL_ROW_7 = f"<tr><td colspan='7'>{_SKEL}</td></tr>"
-_SKEL_ROW_3 = f"<tr><td colspan='3'>{_SKEL}</td></tr>"
-
-
 def _build_dashboard(
-    engine: AnomalyEngine,
-    telemetry: TelemetryStore,
-    runner: PipelineRunner,
+    engine:      AnomalyEngine,
+    telemetry:   TelemetryStore,
+    runner:      PipelineRunner,
     auto_enabled: bool,
-    warmup_done: bool,
+    warmup_done:  bool,
+    start_time:   datetime,
 ) -> str:
-    alerts = engine.get_alerts(10)
-    total_alerts = engine.alert_count
-    quarantine_count = engine.quarantine_count
-    total_runs = runner.run_count
 
+    # --- stats --------------------------------------------------------------
+    alerts         = engine.get_alerts(10)
+    total_alerts   = engine.alert_count
+    quarantined    = engine.quarantine_count
+    total_runs     = runner.run_count
+
+    # --- pipeline status ----------------------------------------------------
     if not alerts:
-        status_color, status_text = "#22c55e", "HEALTHY"
+        sc, st, sh = "#22c55e", "HEALTHY",  "No threats in recent activity"
     elif any(a["severity"] in ("critical", "high") for a in alerts[:3]):
-        status_color, status_text = "#ef4444", "CRITICAL"
+        sc, st, sh = "#ef4444", "CRITICAL", "Active threat &mdash; quarantine triggered"
     else:
-        status_color, status_text = "#f59e0b", "WARNING"
+        sc, st, sh = "#f59e0b", "WARNING",  "Anomalies present &mdash; elevated monitoring"
 
-    # Telemetry rows
+    # --- telemetry table rows -----------------------------------------------
     stage_rows = ""
     for stage in ["collection", "preprocessing", "inference", "postprocessing", "output_delivery"]:
         latest = telemetry.get_latest(stage)
         if latest:
-            top_metrics = [(k, v) for k, v in latest.metrics.items() if isinstance(v, (int, float))][:4]
-            metrics_str = " | ".join(f"{k}={v}" for k, v in top_metrics)
+            top = [(k, v) for k, v in latest.metrics.items() if isinstance(v, (int, float))][:4]
+            mstr = " | ".join(k + "=" + str(v) for k, v in top)
             stage_rows += (
-                f"<tr><td>{stage}</td><td>{latest.record_count}</td>"
-                f"<td class='metric-cell'>{metrics_str}</td></tr>"
+                "<tr><td>" + stage + "</td><td>" + str(latest.record_count) + "</td>"
+                "<td class='mc'>" + mstr + "</td></tr>"
             )
         elif not warmup_done:
-            stage_rows += _SKEL_ROW_3
+            stage_rows += _SKEL_ROW3
         else:
-            stage_rows += f"<tr><td>{stage}</td><td>&#x2014;</td><td class='muted'>no data yet</td></tr>"
+            stage_rows += "<tr><td>" + stage + "</td><td>&mdash;</td><td class='muted'>no data</td></tr>"
 
-    # Alert rows
-    severity_colors = {"low": "#6b7280", "medium": "#f59e0b", "high": "#f97316", "critical": "#ef4444"}
+    # --- alert table rows ---------------------------------------------------
+    SEV_CLR = {"low": "#6b7280", "medium": "#f59e0b", "high": "#f97316", "critical": "#ef4444"}
     alert_rows = ""
     for a in alerts:
-        color = severity_colors.get(a["severity"], "#6b7280")
+        clr = SEV_CLR.get(a["severity"], "#6b7280")
         alert_rows += (
-            f"<tr>"
-            f"<td>{a['id']}</td><td>{a['stage']}</td><td>{a['threat_type']}</td>"
-            f"<td style='color:{color};font-weight:bold'>{a['severity'].upper()}</td>"
-            f"<td>{a['score']}</td>"
-            f"<td class='metric-cell'>{a['response_triggered']}</td>"
-            f"<td class='ts-cell'>{a['timestamp'][:19]}</td>"
-            f"</tr>"
+            "<tr>"
+            "<td>" + a["id"] + "</td>"
+            "<td>" + a["stage"] + "</td>"
+            "<td>" + a["threat_type"] + "</td>"
+            "<td style='color:" + clr + ";font-weight:700'>" + a["severity"].upper() + "</td>"
+            "<td>" + str(a["score"]) + "</td>"
+            "<td class='mc'>" + a["response_triggered"] + "</td>"
+            "<td class='tc'>" + a["timestamp"][:19] + "</td>"
+            "</tr>"
+        )
+    if not alert_rows:
+        alert_rows = (
+            _SKEL_ROW7 * 2 if not warmup_done
+            else "<tr><td colspan='7' class='empty'>No alerts &mdash; pipeline running clean</td></tr>"
         )
 
-    if not alert_rows:
-        if not warmup_done:
-            alert_rows = _SKEL_ROW_7 * 3
-        else:
-            alert_rows = "<tr><td colspan='7' class='empty-cell'>No alerts yet</td></tr>"
+    # --- misc ---------------------------------------------------------------
+    feed_html    = _activity_feed_html(engine, telemetry, warmup_done)
+    feed_count   = len(alerts) + len(telemetry.get_recent("collection", n=20))
+    auto_color   = "#22c55e" if auto_enabled else "#6b7280"
+    auto_lbl     = "ON" if auto_enabled else "OFF"
 
-    auto_status = "ON" if auto_enabled else "OFF"
-    auto_color = "#22c55e" if auto_enabled else "#6b7280"
+    uptime_sec   = int((datetime.now(timezone.utc) - start_time).total_seconds())
+    if uptime_sec < 60:
+        uptime_str = str(uptime_sec) + "s"
+    elif uptime_sec < 3600:
+        uptime_str = str(uptime_sec // 60) + "m " + str(uptime_sec % 60) + "s"
+    else:
+        uptime_str = str(uptime_sec // 3600) + "h " + str((uptime_sec % 3600) // 60) + "m"
+
+    if not warmup_done:
+        sys_status, detect_mode, dot_cls = "Warming Up", "Seeding", "dot-warm"
+    elif auto_enabled:
+        sys_status, detect_mode, dot_cls = "Online",     "Active",  "dot-on"
+    else:
+        sys_status, detect_mode, dot_cls = "Online",     "Passive", "dot-on"
+
     warmup_banner = (
         "<div class='warmup-banner'><div class='spinner'></div>"
-        "<span>Warming up &#x2014; pulling model and seeding baseline. Dashboard populates automatically.</span></div>"
+        "<span>Warming up &mdash; pulling model and seeding detection baseline.</span></div>"
         if not warmup_done else ""
     )
     render_time = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-    return f"""<!DOCTYPE html>
+    # f-string only for the parts that need Python values embedded
+    status_badge_css = (
+        "background:" + sc + "1a;color:" + sc + ";border:1px solid " + sc + "55;"
+    )
+
+    return """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <script>document.documentElement.className = localStorage.getItem('pg-theme') || 'dark';</script>
 <meta http-equiv="refresh" content="5">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>PipelineGuard Dashboard</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PipelineGuard</title>
 <style>
-  html.dark {{
-    --bg-page: #0f172a; --bg-card: #1e293b; --bg-header: #0f172a;
-    --text-primary: #e2e8f0; --text-secondary: #94a3b8; --text-muted: #64748b; --text-disabled: #475569;
-    --border-color: #0f172a; --row-hover: #263248; --skel-base: #1e293b; --skel-shine: #263248;
-  }}
-  html.light {{
-    --bg-page: #f1f5f9; --bg-card: #ffffff; --bg-header: #f8fafc;
-    --text-primary: #1e293b; --text-secondary: #475569; --text-muted: #64748b; --text-disabled: #94a3b8;
-    --border-color: #e2e8f0; --row-hover: #f1f5f9; --skel-base: #e2e8f0; --skel-shine: #f8fafc;
-  }}
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: 'Segoe UI', sans-serif; background: var(--bg-page); color: var(--text-primary); padding: 1.5rem; }}
-  .header-bar {{ display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.3rem; }}
-  h1 {{ font-size: 1.6rem; color: #38bdf8; }}
-  .subtitle {{ color: var(--text-muted); font-size: 0.85rem; margin-bottom: 1.5rem; }}
-  .stats {{ display: flex; gap: 1rem; flex-wrap: wrap; margin-bottom: 1.5rem; }}
-  .stat {{ background: var(--bg-card); border-radius: 8px; padding: 1rem 1.5rem; flex: 1; min-width: 140px; }}
-  .stat .label {{ font-size: 0.75rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }}
-  .stat .value {{ font-size: 2rem; font-weight: 700; margin-top: 0.25rem; }}
-  .status-badge {{ display: inline-block; background: {status_color}22; color: {status_color}; border: 1px solid {status_color}; border-radius: 6px; padding: 0.4rem 1rem; font-weight: 700; font-size: 1.1rem; margin-bottom: 1.5rem; }}
-  table {{ width: 100%; border-collapse: collapse; background: var(--bg-card); border-radius: 8px; overflow: hidden; margin-bottom: 1.5rem; }}
-  th {{ background: var(--bg-header); color: var(--text-secondary); font-size: 0.75rem; text-transform: uppercase; padding: 0.6rem 0.8rem; text-align: left; }}
-  td {{ padding: 0.55rem 0.8rem; border-top: 1px solid var(--border-color); font-size: 0.85rem; }}
-  .metric-cell {{ font-size: 0.75rem; }}
-  .ts-cell {{ font-size: 0.7rem; }}
-  .muted {{ color: var(--text-muted); }}
-  .empty-cell {{ text-align: center; color: var(--text-muted); }}
-  tr:hover td {{ background: var(--row-hover); }}
-  h2 {{ font-size: 1rem; color: var(--text-secondary); margin-bottom: 0.6rem; text-transform: uppercase; letter-spacing: 0.05em; }}
-  .actions {{ display: flex; gap: 0.75rem; flex-wrap: wrap; margin-bottom: 1.5rem; align-items: center; }}
-  .btn {{ padding: 0.5rem 1.2rem; border-radius: 6px; border: none; cursor: pointer; font-size: 0.85rem; font-weight: 600; }}
-  .btn-normal {{ background: #22c55e; color: #000; }}
-  .btn-poison {{ background: #f59e0b; color: #000; }}
-  .btn-adv {{ background: #ef4444; color: #fff; }}
-  .btn-clear {{ background: #475569; color: #fff; }}
-  .btn-theme {{ background: var(--bg-card); color: var(--text-primary); border: 1px solid var(--text-muted); border-radius: 6px; padding: 0.4rem 0.75rem; cursor: pointer; font-size: 1rem; line-height: 1; }}
-  .auto-badge {{ background: {auto_color}22; color: {auto_color}; border: 1px solid {auto_color}; border-radius: 6px; padding: 0.25rem 0.75rem; font-size: 0.8rem; font-weight: 700; }}
-  .footer {{ color: var(--text-disabled); font-size: 0.75rem; margin-top: 1rem; }}
-  .warmup-banner {{ display: flex; align-items: center; gap: 0.75rem; background: var(--bg-card); border: 1px solid #38bdf8; border-radius: 8px; padding: 0.75rem 1.25rem; margin-bottom: 1.5rem; color: #38bdf8; font-size: 0.9rem; }}
-  .spinner {{ width: 16px; height: 16px; border: 2px solid #38bdf8; border-top-color: transparent; border-radius: 50%; animation: spin 0.8s linear infinite; flex-shrink: 0; }}
-  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
-  .skel {{ height: 0.85rem; border-radius: 4px; background: linear-gradient(90deg, var(--skel-base) 25%, var(--skel-shine) 50%, var(--skel-base) 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; }}
-  @keyframes shimmer {{ 0% {{ background-position: 200% 0; }} 100% {{ background-position: -200% 0; }} }}
-  #toast {{ position: fixed; bottom: 1.5rem; right: 1.5rem; padding: 0.75rem 1.25rem; border-radius: 8px; font-size: 0.85rem; font-weight: 600; z-index: 1000; opacity: 0; pointer-events: none; transition: opacity 0.3s; }}
-  #toast.show {{ opacity: 1; pointer-events: auto; }}
-  #toast.success {{ background: #22c55e; color: #000; }}
-  #toast.error {{ background: #ef4444; color: #fff; }}
+  html.dark {
+    --bg:     #0b1120; --card:   #111827; --raised: #1a2436; --hdr: #0d1525;
+    --txt:    #f1f5f9; --sub:    #94a3b8; --muted:  #64748b; --dim: #374151;
+    --border: #1e2d42; --hover:  #172032; --sb: #030709;
+    --sk1: #111827; --sk2: #1a2436;
+  }
+  html.light {
+    --bg:     #f0f4f8; --card:   #ffffff; --raised: #f8fafc; --hdr: #f1f5f9;
+    --txt:    #0f172a; --sub:    #475569; --muted:  #64748b; --dim: #94a3b8;
+    --border: #e2e8f0; --hover:  #f8fafc; --sb: #e8ecf0;
+    --sk1: #e2e8f0; --sk2: #f8fafc;
+  }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:'Segoe UI',system-ui,sans-serif; background:var(--bg); color:var(--txt); padding:1.25rem 1.5rem 3.2rem; }
+
+  /* header */
+  .header { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:1.25rem; gap:1rem; }
+  .brand h1 { font-size:1.6rem; color:#38bdf8; font-weight:800; letter-spacing:-0.02em; }
+  .brand .tagline { font-size:0.8rem; color:var(--muted); margin-top:0.2rem; }
+  .brand .steps { font-size:0.72rem; color:var(--dim); margin-top:0.3rem; letter-spacing:0.01em; }
+  .btn-theme { background:var(--card); color:var(--txt); border:1px solid var(--border); border-radius:6px; padding:0.35rem 0.65rem; cursor:pointer; font-size:0.95rem; }
+
+  /* warmup */
+  .warmup-banner { display:flex; align-items:center; gap:0.65rem; background:var(--card); border:1px solid #38bdf844; border-radius:8px; padding:0.65rem 1rem; margin-bottom:1.25rem; color:#38bdf8; font-size:0.82rem; }
+  .spinner { width:14px; height:14px; border:2px solid #38bdf8; border-top-color:transparent; border-radius:50%; animation:spin 0.8s linear infinite; flex-shrink:0; }
+  @keyframes spin { to { transform:rotate(360deg); } }
+
+  /* main grid */
+  .grid { display:grid; grid-template-columns:1fr 280px; gap:1.25rem; align-items:start; }
+  @media (max-width:900px) { .grid { grid-template-columns:1fr; } }
+
+  /* stats */
+  .stats { display:flex; gap:0.75rem; flex-wrap:wrap; margin-bottom:1.1rem; }
+  .stat { background:var(--card); border-radius:8px; padding:0.85rem 1rem; flex:1; min-width:115px; }
+  .stat .lbl { font-size:0.6rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.08em; font-weight:700; }
+  .stat .val { font-size:1.9rem; font-weight:800; margin:0.15rem 0 0.2rem; line-height:1; }
+  .stat .hint { font-size:0.62rem; color:var(--dim); }
+
+  /* status */
+  .status-wrap { margin-bottom:1rem; }
+  .status-badge { display:inline-block; border-radius:6px; padding:0.3rem 0.8rem; font-weight:800; font-size:0.9rem; letter-spacing:0.03em; }
+  .status-hint { font-size:0.7rem; color:var(--muted); margin-top:0.3rem; }
+
+  /* actions */
+  .actions { display:flex; gap:0.5rem; flex-wrap:wrap; margin-bottom:0.85rem; align-items:center; }
+  .btn { padding:0.4rem 0.9rem; border-radius:6px; border:none; cursor:pointer; font-size:0.78rem; font-weight:700; }
+  .btn:hover { opacity:0.85; }
+  .btn-n { background:#22c55e; color:#000; }
+  .btn-p { background:#f59e0b; color:#000; }
+  .btn-a { background:#ef4444; color:#fff; }
+  .btn-c { background:#374151; color:#9ca3af; }
+  .auto-badge { font-size:0.7rem; font-weight:700; padding:0.2rem 0.6rem; border-radius:20px; border:1px solid; }
+
+  /* section labels */
+  .sec-lbl { font-size:0.62rem; color:var(--muted); text-transform:uppercase; letter-spacing:0.09em; font-weight:700; margin:1rem 0 0.4rem; }
+
+  /* tables */
+  table { width:100%; border-collapse:collapse; background:var(--card); border-radius:8px; overflow:hidden; margin-bottom:0.5rem; }
+  th { background:var(--hdr); color:var(--sub); font-size:0.62rem; text-transform:uppercase; letter-spacing:0.07em; padding:0.5rem 0.7rem; text-align:left; font-weight:700; }
+  td { padding:0.45rem 0.7rem; border-top:1px solid var(--border); font-size:0.8rem; }
+  .mc { font-size:0.68rem; color:var(--sub); }
+  .tc { font-size:0.65rem; color:var(--sub); }
+  .muted { color:var(--muted); }
+  .empty { text-align:center; color:var(--muted); padding:1rem; }
+  tr:hover td { background:var(--hover); }
+
+  /* feed */
+  .feed { background:var(--card); border-radius:8px; overflow:hidden; position:sticky; top:1rem; }
+  .feed-hdr { display:flex; justify-content:space-between; align-items:center; padding:0.55rem 0.8rem; background:var(--hdr); border-bottom:1px solid var(--border); }
+  .feed-title { font-size:0.62rem; text-transform:uppercase; letter-spacing:0.09em; font-weight:700; color:var(--sub); }
+  .feed-ct { font-size:0.6rem; background:var(--raised); color:var(--muted); border-radius:20px; padding:0.12rem 0.45rem; }
+  .feed-body { max-height:72vh; overflow-y:auto; }
+  .feed-item { display:flex; gap:0.5rem; padding:0.55rem 0.8rem; border-top:1px solid var(--border); border-left:3px solid transparent; }
+  .feed-item:first-child { border-top:none; }
+  .feed-item:hover { background:var(--hover); }
+  .fi-critical { border-left-color:#ef4444; }
+  .fi-high     { border-left-color:#f97316; }
+  .fi-medium   { border-left-color:#f59e0b; }
+  .fi-low      { border-left-color:#6b7280; }
+  .fi-icon     { font-size:0.9rem; flex-shrink:0; padding-top:0.05rem; }
+  .fi-label    { font-size:0.75rem; font-weight:600; margin-bottom:0.1rem; line-height:1.3; }
+  .fi-detail   { font-size:0.63rem; color:var(--muted); margin-bottom:0.15rem; }
+  .fi-ts       { font-size:0.58rem; color:var(--dim); }
+  .rep         { display:inline-block; background:var(--raised); color:var(--muted); border-radius:10px; padding:0.05rem 0.35rem; font-size:0.58rem; font-weight:700; margin-left:0.3rem; vertical-align:middle; }
+  .feed-empty  { padding:1.5rem; text-align:center; color:var(--muted); font-size:0.78rem; display:flex; align-items:center; justify-content:center; gap:0.5rem; }
+
+  /* status bar */
+  .sb { position:fixed; bottom:0; left:0; right:0; background:var(--sb); border-top:1px solid var(--border); padding:0.38rem 1.5rem; display:flex; gap:1.5rem; align-items:center; font-size:0.68rem; color:var(--sub); z-index:200; flex-wrap:wrap; }
+  .sb-it { display:flex; align-items:center; gap:0.3rem; }
+  .sb-dot { width:6px; height:6px; border-radius:50%; }
+  .dot-on   { background:#22c55e; animation:pulse 2.5s infinite; }
+  .dot-warm { background:#f59e0b; animation:pulse 1s infinite; }
+  .sb-lbl { color:var(--dim); }
+  .sb-val { color:var(--txt); font-weight:600; }
+  .sb-r   { margin-left:auto; color:var(--dim); }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.25} }
+
+  /* skeleton */
+  .skel { height:0.78rem; border-radius:3px; background:linear-gradient(90deg,var(--sk1) 25%,var(--sk2) 50%,var(--sk1) 75%); background-size:200% 100%; animation:shimmer 1.5s infinite; }
+  @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+
+  /* toast */
+  #toast { position:fixed; bottom:2.8rem; right:1.5rem; padding:0.6rem 1rem; border-radius:7px; font-size:0.8rem; font-weight:600; z-index:1000; opacity:0; pointer-events:none; transition:opacity 0.25s; }
+  #toast.show { opacity:1; pointer-events:auto; }
+  #toast.ok  { background:#22c55e; color:#000; }
+  #toast.err { background:#ef4444; color:#fff; }
 </style>
 </head>
 <body>
-<div class="header-bar">
-  <h1>&#x1F6E1; PipelineGuard</h1>
+
+<div class="header">
+  <div class="brand">
+    <h1>&#x1F6E1; PipelineGuard</h1>
+    <div class="tagline">Real-time threat detection for healthcare AI inference pipelines</div>
+    <div class="steps">Data Collection &#x203A; Preprocessing &#x203A; AI Inference &#x203A; Anomaly Detection &#x203A; Auto-Response</div>
+  </div>
   <button id="theme-btn" class="btn-theme" onclick="toggleTheme()" title="Toggle dark/light mode">&#x1F319;</button>
 </div>
-<p class="subtitle">Healthcare AI Pipeline Security Monitor &nbsp;&middot;&nbsp; Auto-refreshes every 5s &nbsp;&middot;&nbsp; Auto-run: <span class="auto-badge">{auto_status}</span></p>
 
-{warmup_banner}
-<div class="stats">
-  <div class="stat"><div class="label">Total Runs</div><div class="value" style="color:#38bdf8">{total_runs}</div></div>
-  <div class="stat"><div class="label">Total Alerts</div><div class="value" style="color:#f59e0b">{total_alerts}</div></div>
-  <div class="stat"><div class="label">Quarantined</div><div class="value" style="color:#ef4444">{quarantine_count}</div></div>
-  <div class="stat"><div class="label">Sensitivity</div><div class="value" style="color:#a78bfa;font-size:1.3rem">{SENSITIVITY.upper()}</div></div>
+""" + warmup_banner + """
+<div class="grid">
+
+  <div>
+    <div class="stats">
+      <div class="stat">
+        <div class="lbl">Total Runs</div>
+        <div class="val" style="color:#38bdf8">""" + str(total_runs) + """</div>
+        <div class="hint">batches processed since startup</div>
+      </div>
+      <div class="stat">
+        <div class="lbl">Alerts</div>
+        <div class="val" style="color:#f59e0b">""" + str(total_alerts) + """</div>
+        <div class="hint">threats flagged across all stages</div>
+      </div>
+      <div class="stat">
+        <div class="lbl">Quarantined</div>
+        <div class="val" style="color:#ef4444">""" + str(quarantined) + """</div>
+        <div class="hint">batches blocked before delivery</div>
+      </div>
+      <div class="stat">
+        <div class="lbl">Sensitivity</div>
+        <div class="val" style="color:#a78bfa;font-size:1.3rem">""" + SENSITIVITY.upper() + """</div>
+        <div class="hint">detection threshold level</div>
+      </div>
+    </div>
+
+    <div class="status-wrap">
+      <div class="status-badge" style=\"""" + status_badge_css + """\">PIPELINE: """ + st + """</div>
+      <div class="status-hint">""" + sh + """</div>
+    </div>
+
+    <div class="actions">
+      <button class="btn btn-n" onclick="triggerRun('normal')"
+        title="Process a clean 20-record patient batch">&#x25B6; Run Normal</button>
+      <button class="btn btn-p" onclick="triggerRun('poisoned')"
+        title="30% of records shifted 2-3 sigma -- simulates data poisoning">&#x2623; Run Poisoned</button>
+      <button class="btn btn-a" onclick="triggerRun('adversarial')"
+        title="One extreme adversarial record designed to fool the model">&#x26A1; Run Adversarial</button>
+      <button class="btn btn-c" onclick="clearAlerts()">&#x2715; Reset</button>
+      <span class="auto-badge" style="color:""" + auto_color + """;border-color:""" + auto_color + """44;background:""" + auto_color + """11">Auto """ + auto_lbl + """</span>
+    </div>
+
+    <div class="sec-lbl">Recent Alerts</div>
+    <table>
+      <thead><tr><th>ID</th><th>Stage</th><th>Threat</th><th>Severity</th><th>Score</th><th>Response</th><th>Time (UTC)</th></tr></thead>
+      <tbody>""" + alert_rows + """</tbody>
+    </table>
+
+    <div class="sec-lbl">Stage Telemetry</div>
+    <table>
+      <thead><tr><th>Stage</th><th>Records</th><th>Key Metrics</th></tr></thead>
+      <tbody>""" + stage_rows + """</tbody>
+    </table>
+  </div>
+
+  <div>
+    <div class="feed">
+      <div class="feed-hdr">
+        <span class="feed-title">&#x1F4E1; Live Activity</span>
+        <span class="feed-ct">""" + str(feed_count) + """ events</span>
+      </div>
+      <div class="feed-body">""" + feed_html + """</div>
+    </div>
+  </div>
+
 </div>
 
-<div class="status-badge">PIPELINE STATUS: {status_text}</div>
-
-<div class="actions">
-  <button class="btn btn-normal" onclick="triggerRun('normal')">&#x25B6; Run Normal</button>
-  <button class="btn btn-poison" onclick="triggerRun('poisoned')">&#x2623; Run Poisoned</button>
-  <button class="btn btn-adv" onclick="triggerRun('adversarial')">&#x26A1; Run Adversarial</button>
-  <button class="btn btn-clear" onclick="clearAlerts()">&#x2715; Clear Alerts</button>
+<div class="sb">
+  <div class="sb-it">
+    <span class="sb-dot """ + dot_cls + """"></span>
+    <span class="sb-lbl">Status</span>
+    <span class="sb-val">""" + sys_status + """</span>
+  </div>
+  <div class="sb-it"><span class="sb-lbl">Model</span><span class="sb-val">""" + OLLAMA_MODEL + """</span></div>
+  <div class="sb-it"><span class="sb-lbl">Detection</span><span class="sb-val">""" + detect_mode + """</span></div>
+  <div class="sb-it"><span class="sb-lbl">Sensitivity</span><span class="sb-val">""" + SENSITIVITY + """</span></div>
+  <div class="sb-it"><span class="sb-lbl">Uptime</span><span class="sb-val">""" + uptime_str + """</span></div>
+  <div class="sb-r">""" + render_time + """ UTC &middot; refreshes every 5s</div>
 </div>
 
-<h2>Recent Alerts (last 10)</h2>
-<table>
-  <thead><tr><th>ID</th><th>Stage</th><th>Threat Type</th><th>Severity</th><th>Score</th><th>Response</th><th>Timestamp</th></tr></thead>
-  <tbody>{alert_rows}</tbody>
-</table>
-
-<h2>Stage Telemetry</h2>
-<table>
-  <thead><tr><th>Stage</th><th>Records</th><th>Key Metrics</th></tr></thead>
-  <tbody>{stage_rows}</tbody>
-</table>
-
-<p class="footer">Last render: {render_time} UTC &nbsp;&middot;&nbsp; Model: {OLLAMA_MODEL} &nbsp;&middot;&nbsp; Interval: {RUN_INTERVAL}s</p>
 <div id="toast"></div>
 
 <script>
-(function() {{
+(function() {
   var cls = localStorage.getItem('pg-theme') || 'dark';
   document.documentElement.className = cls;
   var btn = document.getElementById('theme-btn');
   if (btn) btn.innerHTML = cls === 'dark' ? '&#x1F319;' : '&#x2600;&#xFE0F;';
-}})();
+})();
 
-function toggleTheme() {{
+function toggleTheme() {
   var html = document.documentElement;
   var next = html.classList.contains('light') ? 'dark' : 'light';
   html.className = next;
   localStorage.setItem('pg-theme', next);
   document.getElementById('theme-btn').innerHTML = next === 'dark' ? '&#x1F319;' : '&#x2600;&#xFE0F;';
-}}
+}
 
-function showToast(msg, type) {{
+function showToast(msg, cls) {
   var t = document.getElementById('toast');
   t.textContent = msg;
-  t.className = 'show ' + type;
-  setTimeout(function() {{ t.className = ''; }}, 3000);
-}}
+  t.className = 'show ' + cls;
+  setTimeout(function() { t.className = ''; }, 3000);
+}
 
-async function triggerRun(mode) {{
-  try {{
-    const resp = await fetch('/run', {{
+async function triggerRun(mode) {
+  try {
+    const resp = await fetch('/run', {
       method: 'POST',
-      headers: {{'Content-Type': 'application/json'}},
-      body: JSON.stringify({{mode}})
-    }});
-    if (!resp.ok) {{
-      const err = await resp.json().catch(function() {{ return {{detail: 'Unknown error'}}; }});
-      throw new Error(err.detail || 'Request failed');
-    }}
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({mode})
+    });
+    if (!resp.ok) {
+      const e = await resp.json().catch(function() { return {detail: 'Unknown error'}; });
+      throw new Error(e.detail || 'Request failed');
+    }
     const data = await resp.json();
     const n = (data.alerts_triggered || []).length;
-    showToast('Run complete — ' + n + ' alert(s)', 'success');
-    setTimeout(function() {{ location.reload(); }}, 800);
-  }} catch (err) {{
-    showToast('Error: ' + err.message, 'error');
-  }}
-}}
+    showToast(n > 0 ? n + ' alert(s) raised' : 'Clean run -- no threats', n > 0 ? 'err' : 'ok');
+    setTimeout(function() { location.reload(); }, 900);
+  } catch (err) {
+    showToast('Error: ' + err.message, 'err');
+  }
+}
 
-async function clearAlerts() {{
-  try {{
-    const resp = await fetch('/alerts', {{method: 'DELETE'}});
-    if (!resp.ok) throw new Error('Failed to clear alerts');
-    showToast('Alerts cleared', 'success');
-    setTimeout(function() {{ location.reload(); }}, 800);
-  }} catch (err) {{
-    showToast('Error: ' + err.message, 'error');
-  }}
-}}
+async function clearAlerts() {
+  try {
+    const resp = await fetch('/alerts', {method: 'DELETE'});
+    if (!resp.ok) throw new Error('Failed to reset');
+    showToast('Dashboard reset', 'ok');
+    setTimeout(function() { location.reload(); }, 800);
+  } catch (err) {
+    showToast('Error: ' + err.message, 'err');
+  }
+}
 </script>
 </body>
 </html>"""
@@ -333,19 +542,20 @@ async function clearAlerts() {{
 
 @app.get("/", response_class=HTMLResponse)
 async def dashboard():
-    """Live dashboard — auto-refreshes every 5 seconds."""
+    """Live dashboard."""
     return _build_dashboard(
         app.state.engine,
         app.state.telemetry,
         app.state.runner,
         app.state.auto_run_enabled,
         app.state.warmup_done,
+        app.state.start_time,
     )
 
 
 @app.post("/run")
 async def trigger_run(req: RunRequest):
-    """Trigger a single pipeline run (offloaded to thread pool to avoid blocking the event loop)."""
+    """Trigger a single pipeline run."""
     if req.mode not in ("normal", "poisoned", "adversarial"):
         raise HTTPException(status_code=400, detail="mode must be 'normal', 'poisoned', or 'adversarial'")
     loop = asyncio.get_running_loop()
@@ -378,13 +588,11 @@ async def toggle_auto_run(req: AutoRunRequest):
 
 @app.get("/alerts")
 async def get_alerts():
-    """Return all alerts, most recent first, up to 100."""
     return app.state.engine.get_alerts(100)
 
 
 @app.get("/alerts/{alert_id}")
 async def get_alert(alert_id: str):
-    """Return a single alert by ID."""
     for alert in app.state.engine.alerts:
         if alert.id == alert_id:
             return alert.to_dict()
@@ -393,7 +601,6 @@ async def get_alert(alert_id: str):
 
 @app.get("/telemetry/{stage}")
 async def get_telemetry(stage: str):
-    """Return the last 20 telemetry readings for a stage."""
     readings = app.state.telemetry.get_recent(stage, n=20)
     if not readings:
         raise HTTPException(status_code=404, detail=f"No telemetry for stage {stage!r}")
@@ -411,11 +618,9 @@ async def get_telemetry(stage: str):
 
 @app.get("/health")
 async def health():
-    """Basic health check including Ollama connectivity and warmup status."""
-    ollama_ok = app.state.ollama.is_available()
     return {
         "status": "ok",
-        "ollama": ollama_ok,
+        "ollama": app.state.ollama.is_available(),
         "model": OLLAMA_MODEL,
         "sensitivity": SENSITIVITY,
         "auto_run": app.state.auto_run_enabled,
@@ -425,6 +630,5 @@ async def health():
 
 @app.delete("/alerts")
 async def clear_alerts():
-    """Clear all alerts and quarantine state (for demo resets)."""
     app.state.engine.clear_alerts()
     return {"cleared": True}
