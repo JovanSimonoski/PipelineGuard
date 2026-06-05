@@ -7,6 +7,7 @@ services:
       OLLAMA_DEBUG: "false"
     volumes:
       - ollama_data:/root/.ollama
+    restart: unless-stopped
     healthcheck:
       test: ["CMD", "ollama", "list"]
       interval: 10s
@@ -29,6 +30,13 @@ services:
       SKIP_INFERENCE: "false"
     volumes:
       - ./:/app
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
 volumes:
   ollama_data:
