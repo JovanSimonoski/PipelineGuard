@@ -31,6 +31,7 @@ class PipelineRunner:
         self.telemetry = telemetry
         self.ollama = ollama_client
         self.run_count = 0
+        self.last_run: dict | None = None
 
         self._probes = {
             "collection":      CollectionProbe(telemetry),
@@ -70,6 +71,8 @@ class PipelineRunner:
             ("output_delivery", lambda r: stage_output_delivery(r)),
         ]
 
+        stage_names = [s for s, _ in stage_fns]
+        stage_results: dict[str, str] = {}  # stage -> "ok" | "alert" | "quarantined" | "skipped"
         records = raw_records
         for stage_name, stage_fn in stage_fns:
             records, meta = stage_fn(records)
@@ -98,12 +101,21 @@ class PipelineRunner:
                     f"[Pipeline] Batch {batch_id} quarantined — stopping at stage {stage_name}",
                     style="bold yellow",
                 )
+                stage_results[stage_name] = "quarantined"
                 quarantined = True
                 break
+            elif new_alerts:
+                stage_results[stage_name] = "alert"
+            else:
+                stage_results[stage_name] = "ok"
+
+        for sn in stage_names:
+            if sn not in stage_results:
+                stage_results[sn] = "skipped"
 
         duration_ms = int((time.monotonic() - t_start) * 1000)
 
-        return {
+        result = {
             "run_id": run_id,
             "attack_mode": attack_mode,
             "stages_completed": stages_completed,
@@ -120,4 +132,7 @@ class PipelineRunner:
             "quarantined": quarantined,
             "duration_ms": duration_ms,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "stage_results": stage_results,
         }
+        self.last_run = result
+        return result

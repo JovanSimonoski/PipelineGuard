@@ -2,10 +2,13 @@
 """FastAPI application: REST endpoints + live HTML dashboard."""
 
 import asyncio
+import json
 import os
 import threading
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+
+import numpy as np
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, HTTPException
@@ -170,6 +173,140 @@ def _activity_feed_html(engine: AnomalyEngine, telemetry: TelemetryStore, warmup
 
 
 # ---------------------------------------------------------------------------
+# Dashboard helpers – explainability panels
+# ---------------------------------------------------------------------------
+
+_STAGE_ICONS = {
+    "collection":      "&#x1F4E5;",
+    "preprocessing":   "&#x2699;",
+    "inference":       "&#x1F9E0;",
+    "postprocessing":  "&#x1F4CA;",
+    "output_delivery": "&#x1F4E4;",
+}
+
+def _pipeline_flow_html(runner, engine: AnomalyEngine, warmup_done: bool) -> str:
+    """Horizontal stage-flow strip with per-stage status."""
+    last = runner.last_run or {}
+    stage_results = last.get("stage_results", {})
+    attack_mode = last.get("attack_mode", "normal")
+    MODE_COLORS = {"normal": "#22c55e", "poisoned": "#f59e0b", "adversarial": "#ef4444"}
+    mode_color = MODE_COLORS.get(attack_mode, "#94a3b8")
+
+    STATUS_CFG = {
+        "ok":          ("#22c55e", "OK",         "Clean"),
+        "alert":       ("#ef4444", "ALERT",       "Threat detected"),
+        "quarantined": ("#f59e0b", "QUARANTINED", "Pipeline stopped"),
+        "skipped":     ("#374151", "SKIPPED",     "Not reached"),
+    }
+
+    stages = ["collection", "preprocessing", "inference", "postprocessing", "output_delivery"]
+    stage_labels = ["Collection", "Preprocessing", "AI Inference", "Postprocessing", "Delivery"]
+
+    html = "<div class='pipeline-flow'>"
+    if last:
+        mode_badge = (
+            f"<span class='run-mode-badge' style='background:{mode_color}22;"
+            f"color:{mode_color};border-color:{mode_color}55'>"
+            f"Last run: {attack_mode.upper()}"
+            f" &nbsp;&#x231A;&nbsp; {last.get('duration_ms', 0)} ms"
+            f" &nbsp;&#x2713;&nbsp; {last.get('stages_completed', 0)}/5 stages</span>"
+        )
+        html += f"<div class='flow-meta'>{mode_badge}</div>"
+
+    html += "<div class='flow-stages'>"
+    for i, (sn, label) in enumerate(zip(stages, stage_labels)):
+        status = stage_results.get(sn, "skipped") if last else ("seeding" if not warmup_done else "pending")
+        if status == "seeding" or status == "pending":
+            clr, tag, tip = "#94a3b8", "–", "Waiting"
+        else:
+            clr, tag, tip = STATUS_CFG.get(status, STATUS_CFG["skipped"])
+
+        icon = _STAGE_ICONS.get(sn, "&#x25A1;")
+        arrow = "<div class='flow-arrow'>&#x203A;</div>" if i < len(stages) - 1 else ""
+        html += (
+            f"<div class='flow-stage' title='{tip}'>"
+            f"<div class='fs-icon' style='background:{clr}22;border-color:{clr}44'>{icon}</div>"
+            f"<div class='fs-name'>{label}</div>"
+            f"<div class='fs-tag' style='color:{clr}'>{tag}</div>"
+            f"</div>{arrow}"
+        )
+    html += "</div></div>"
+    return html
+
+
+def _baseline_panel_html(engine: AnomalyEngine, telemetry: TelemetryStore) -> str:
+    """Per-stage baseline maturity + current metric vs baseline."""
+    snap = engine.baseline.snapshot()
+    stages = ["collection", "preprocessing", "inference", "postprocessing", "output_delivery"]
+    WINDOW = 30
+
+    html = "<div class='baseline-grid'>"
+    for stage in stages:
+        stage_metrics = snap.get(stage, {})
+        latest = telemetry.get_latest(stage)
+        icon = _STAGE_ICONS.get(stage, "")
+        label = stage.replace("_", " ").title()
+
+        # overall sample count = min across metrics (or 0)
+        counts = [len(v) for v in stage_metrics.values() if v]
+        sample_n = min(counts) if counts else 0
+        pct = min(int(sample_n / WINDOW * 100), 100)
+        established = sample_n >= 10
+        bar_color = "#22c55e" if established else "#f59e0b"
+
+        html += (
+            f"<div class='bl-card'>"
+            f"<div class='bl-header'>"
+            f"<span class='bl-icon'>{icon}</span>"
+            f"<span class='bl-title'>{label}</span>"
+            f"<span class='bl-status' style='color:{bar_color}'>"
+            f"{'&#x2713; Established' if established else '&#x23F3; Seeding'}"
+            f"</span></div>"
+            f"<div class='bl-bar-wrap'>"
+            f"<div class='bl-bar' style='width:{pct}%;background:{bar_color}'></div>"
+            f"</div>"
+            f"<div class='bl-bar-lbl'>{sample_n}/{WINDOW} samples</div>"
+        )
+
+        # per-metric rows
+        if latest and stage_metrics:
+            html += "<table class='bl-metrics'><thead><tr><th>Metric</th><th>Current</th><th>Baseline μ</th><th>Δσ (Z)</th></tr></thead><tbody>"
+            for metric, vals in list(stage_metrics.items())[:5]:
+                cur = latest.metrics.get(metric)
+                if cur is None or not isinstance(cur, (int, float)):
+                    continue
+                arr = [float(x) for x in vals]
+                mean = float(np.mean(arr)) if arr else None
+                std  = float(np.std(arr))  if arr else None
+                if mean is not None and std is not None and std > 1e-6:
+                    z = (cur - mean) / std
+                    z_str = f"{z:+.2f}"
+                    z_color = "#ef4444" if abs(z) > 2.5 else ("#f59e0b" if abs(z) > 1.5 else "#22c55e")
+                else:
+                    z_str, z_color = "–", "var(--muted)"
+                mean_str = f"{mean:.3f}" if mean is not None else "–"
+                cur_str  = f"{cur:.3f}" if isinstance(cur, float) else str(cur)
+                html += (
+                    f"<tr><td class='bl-m-name'>{metric}</td>"
+                    f"<td>{cur_str}</td>"
+                    f"<td class='muted'>{mean_str}</td>"
+                    f"<td style='color:{z_color};font-weight:700'>{z_str}</td></tr>"
+                )
+            html += "</tbody></table>"
+        html += "</div>"
+    html += "</div>"
+    return html
+
+
+def _alert_details_js_data(alerts: list[dict]) -> str:
+    """Emit alert detail data as a JS object so rows can be expanded inline."""
+    detail_map = {}
+    for a in alerts:
+        detail_map[a["id"]] = a.get("details", [])
+    return "var ALERT_DETAILS = " + json.dumps(detail_map) + ";"
+
+
+# ---------------------------------------------------------------------------
 # Dashboard HTML
 # ---------------------------------------------------------------------------
 
@@ -217,9 +354,10 @@ def _build_dashboard(
     alert_rows = ""
     for a in alerts:
         clr = SEV_CLR.get(a["severity"], "#6b7280")
+        detail_id = "det-" + a["id"]
         alert_rows += (
-            "<tr>"
-            "<td>" + a["id"] + "</td>"
+            "<tr class='expandable' onclick=\"toggleDetail('" + a["id"] + "')\">"
+            "<td><span class='expand-icon'>&#x25B6;</span>" + a["id"] + "</td>"
             "<td>" + a["stage"] + "</td>"
             "<td>" + a["threat_type"] + "</td>"
             "<td style='color:" + clr + ";font-weight:700'>" + a["severity"].upper() + "</td>"
@@ -227,12 +365,20 @@ def _build_dashboard(
             "<td class='mc'>" + a["response_triggered"] + "</td>"
             "<td class='tc'>" + a["timestamp"][:19] + "</td>"
             "</tr>"
+            "<tr class='alert-detail-row' id='" + detail_id + "' style='display:none'>"
+            "<td colspan='7'><div class='alert-detail-wrap' id='adw-" + a["id"] + "'></div></td>"
+            "</tr>"
         )
     if not alert_rows:
         alert_rows = (
             _SKEL_ROW7 * 2 if not warmup_done
             else "<tr><td colspan='7' class='empty'>No alerts &mdash; pipeline running clean</td></tr>"
         )
+
+    # --- new explainability panels -----------------------------------------
+    flow_html      = _pipeline_flow_html(runner, engine, warmup_done)
+    baseline_html  = _baseline_panel_html(engine, telemetry)
+    alert_detail_js = _alert_details_js_data(engine.get_alerts(10))
 
     # --- misc ---------------------------------------------------------------
     feed_html    = _activity_feed_html(engine, telemetry, warmup_done)
@@ -382,6 +528,51 @@ def _build_dashboard(
   #toast.show { opacity:1; pointer-events:auto; }
   #toast.ok  { background:#22c55e; color:#000; }
   #toast.err { background:#ef4444; color:#fff; }
+
+  /* pipeline flow */
+  .pipeline-flow { background:var(--card); border-radius:8px; padding:0.75rem 1rem; margin-bottom:1rem; }
+  .flow-meta { margin-bottom:0.6rem; }
+  .run-mode-badge { display:inline-block; border-radius:20px; border:1px solid; padding:0.2rem 0.7rem; font-size:0.68rem; font-weight:700; }
+  .flow-stages { display:flex; align-items:center; gap:0; overflow-x:auto; padding-bottom:0.2rem; }
+  .flow-stage { display:flex; flex-direction:column; align-items:center; gap:0.25rem; min-width:90px; }
+  .fs-icon { width:40px; height:40px; border-radius:50%; border:2px solid; display:flex; align-items:center; justify-content:center; font-size:1.1rem; }
+  .fs-name { font-size:0.6rem; color:var(--sub); text-align:center; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; }
+  .fs-tag  { font-size:0.62rem; font-weight:800; letter-spacing:0.04em; }
+  .flow-arrow { color:var(--dim); font-size:1.3rem; padding:0 0.15rem; flex-shrink:0; margin-bottom:1rem; }
+
+  /* alert details expansion */
+  .alert-detail-row td { background:var(--raised) !important; padding:0.6rem 0.9rem; }
+  .alert-detail-wrap { font-size:0.72rem; }
+  .ad-check { display:inline-block; background:var(--card); border:1px solid var(--border); border-radius:5px; padding:0.25rem 0.6rem; margin:0.15rem 0.15rem 0 0; font-size:0.67rem; }
+  .ad-key { color:var(--muted); }
+  .ad-val { color:var(--txt); font-weight:600; }
+  .ad-z   { color:#ef4444; font-weight:700; }
+  tr.expandable { cursor:pointer; }
+  tr.expandable:hover td { background:var(--hover); }
+  .expand-icon { display:inline-block; transition:transform 0.15s; font-size:0.65rem; margin-right:0.3rem; }
+  .expanded .expand-icon { transform:rotate(90deg); }
+
+  /* baseline panel */
+  .baseline-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(260px,1fr)); gap:0.75rem; margin-bottom:0.5rem; }
+  .bl-card { background:var(--card); border-radius:8px; padding:0.75rem; }
+  .bl-header { display:flex; align-items:center; gap:0.4rem; margin-bottom:0.5rem; }
+  .bl-icon  { font-size:1rem; }
+  .bl-title { font-size:0.72rem; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; flex:1; }
+  .bl-status { font-size:0.62rem; font-weight:700; }
+  .bl-bar-wrap { background:var(--raised); border-radius:4px; height:5px; margin-bottom:0.25rem; }
+  .bl-bar { height:5px; border-radius:4px; transition:width 0.4s; }
+  .bl-bar-lbl { font-size:0.58rem; color:var(--muted); margin-bottom:0.5rem; }
+  .bl-metrics { width:100%; border-collapse:collapse; font-size:0.65rem; }
+  .bl-metrics th { color:var(--dim); font-size:0.58rem; font-weight:700; text-transform:uppercase; padding:0.18rem 0.3rem; border-bottom:1px solid var(--border); }
+  .bl-metrics td { padding:0.18rem 0.3rem; border-top:1px solid var(--border); }
+  .bl-m-name { color:var(--sub); font-size:0.63rem; }
+
+  /* detector legend */
+  .detector-legend { display:flex; gap:0.75rem; flex-wrap:wrap; margin-bottom:1rem; }
+  .dl-card { background:var(--card); border-radius:8px; padding:0.65rem 0.85rem; flex:1; min-width:180px; border-left:3px solid; }
+  .dl-title { font-size:0.65rem; font-weight:800; text-transform:uppercase; letter-spacing:0.06em; margin-bottom:0.35rem; }
+  .dl-row { font-size:0.63rem; color:var(--sub); margin:0.12rem 0; }
+  .dl-row b { color:var(--txt); }
 </style>
 </head>
 <body>
@@ -396,6 +587,9 @@ def _build_dashboard(
 </div>
 
 """ + warmup_banner + """
+
+""" + flow_html + """
+
 <div class="grid">
 
   <div>
@@ -444,7 +638,35 @@ def _build_dashboard(
       <tbody>""" + alert_rows + """</tbody>
     </table>
 
-    <div class="sec-lbl">Stage Telemetry</div>
+    <div class="sec-lbl">Detection Engines</div>
+    <div class="detector-legend">
+      <div class="dl-card" style="border-color:#f59e0b">
+        <div class="dl-title" style="color:#f59e0b">&#x2623; Poisoning Detector</div>
+        <div class="dl-row">Watches for <b>statistical drift</b> in any numeric metric</div>
+        <div class="dl-row">Method: <b>Z-score</b> against rolling 30-sample baseline</div>
+        <div class="dl-row">Fires when Z &gt; <b>""" + str(engine.poisoning.threshold) + """</b> &sigma; (""" + SENSITIVITY + """ sensitivity)</div>
+        <div class="dl-row">Stages: <b>all 5 stages</b></div>
+      </div>
+      <div class="dl-card" style="border-color:#ef4444">
+        <div class="dl-title" style="color:#ef4444">&#x26A1; Adversarial Detector</div>
+        <div class="dl-row">Watches for <b>model confidence collapse</b> at inference</div>
+        <div class="dl-row">Checks: low avg conf &lt; <b>""" + str(engine.adversarial.low_conf_threshold) + """</b>, unknown rate &gt; <b>""" + str(engine.adversarial.unknown_rate_threshold) + """</b></div>
+        <div class="dl-row">Also: confidence drop vs baseline (Z &gt; 2.0), high variance (Z &gt; <b>""" + str(engine.adversarial.conf_std_multiplier) + """</b>)</div>
+        <div class="dl-row">Stages: <b>inference only</b></div>
+      </div>
+      <div class="dl-card" style="border-color:#a78bfa">
+        <div class="dl-title" style="color:#a78bfa">&#x1F4CA; Abuse Detector</div>
+        <div class="dl-row">Watches for <b>batch-size spikes &amp; drop-rate anomalies</b></div>
+        <div class="dl-row">Fires when count ratio &gt; <b>""" + str(engine.abuse.spike_factor) + """&times;</b> baseline mean</div>
+        <div class="dl-row">Also: drop-rate spike &amp; normalization-violation spike (Z &gt; 2.5)</div>
+        <div class="dl-row">Stages: <b>all stages</b> (extra checks on preprocessing)</div>
+      </div>
+    </div>
+
+    <div class="sec-lbl">Baseline Maturity &amp; Metric Comparison</div>
+    """ + baseline_html + """
+
+    <div class="sec-lbl">Stage Telemetry (latest reading)</div>
     <table>
       <thead><tr><th>Stage</th><th>Records</th><th>Key Metrics</th></tr></thead>
       <tbody>""" + stage_rows + """</tbody>
@@ -479,6 +701,7 @@ def _build_dashboard(
 <div id="toast"></div>
 
 <script>
+""" + alert_detail_js + """
 (function() {
   var cls = localStorage.getItem('pg-theme') || 'dark';
   document.documentElement.className = cls;
@@ -529,6 +752,31 @@ async function clearAlerts() {
     setTimeout(function() { location.reload(); }, 800);
   } catch (err) {
     showToast('Error: ' + err.message, 'err');
+  }
+}
+
+function toggleDetail(id) {
+  var row = document.getElementById('det-' + id);
+  var wrap = document.getElementById('adw-' + id);
+  var expandIcon = row.previousElementSibling.querySelector('.expand-icon');
+  if (!row) return;
+  var visible = row.style.display !== 'none';
+  row.style.display = visible ? 'none' : '';
+  if (expandIcon) expandIcon.parentElement.parentElement.classList.toggle('expanded', !visible);
+  if (!visible && wrap && wrap.innerHTML === '') {
+    var details = ALERT_DETAILS[id] || [];
+    if (!details.length) { wrap.innerHTML = '<span style="color:var(--muted)">No sub-details available</span>'; return; }
+    var html = '';
+    details.forEach(function(d) {
+      html += '<span class="ad-check">';
+      Object.entries(d).forEach(function([k, v]) {
+        var cls = k === 'z_score' || k === 'z_score' ? 'ad-z' : (k === 'metric' || k === 'check' ? 'ad-val' : 'ad-val');
+        if (k === 'z_score') cls = 'ad-z';
+        html += '<span class="ad-key">' + k + ':&nbsp;</span><span class="' + cls + '">' + v + '</span> &nbsp;';
+      });
+      html += '</span>';
+    });
+    wrap.innerHTML = html;
   }
 }
 </script>
@@ -632,3 +880,25 @@ async def health():
 async def clear_alerts():
     app.state.engine.clear_alerts()
     return {"cleared": True}
+
+
+@app.get("/diagnostics")
+async def diagnostics():
+    """Return baseline sample counts, detector thresholds, and last run info."""
+    engine: AnomalyEngine = app.state.engine
+    snap = engine.baseline.snapshot()
+    baseline_counts: dict = {}
+    for stage, metrics in snap.items():
+        baseline_counts[stage] = {m: len(v) for m, v in metrics.items()}
+
+    return {
+        "baseline_counts": baseline_counts,
+        "detector_thresholds": {
+            "poisoning_zscore": engine.poisoning.threshold,
+            "adversarial_low_conf": engine.adversarial.low_conf_threshold,
+            "adversarial_unknown_rate": engine.adversarial.unknown_rate_threshold,
+            "adversarial_conf_std_mult": engine.adversarial.conf_std_multiplier,
+            "abuse_spike_factor": engine.abuse.spike_factor,
+        },
+        "last_run": app.state.runner.last_run,
+    }
